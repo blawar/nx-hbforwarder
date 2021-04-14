@@ -2,6 +2,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <stdio.h>
 
 #define DEFAULT_NRO "sdmc:/hbmenu.nro"
 
@@ -9,6 +10,7 @@ const char g_noticeText[] =
     "nx-hbloader " VERSION "\0"
     "Do you mean to tell me that you're thinking seriously of building that way, when and if you are an architect?";
 
+static char g_launchArgs[2048];
 static char g_argv[2048];
 static char g_nextArgv[2048];
 static char g_nextNroPath[512];
@@ -38,6 +40,8 @@ Result g_lastRet = 0;
 
 extern void* __stack_top;//Defined in libnx.
 #define STACK_SIZE 0x100000 //Change this if main-thread stack size ever changes.
+
+__attribute__((weak)) u32 __nx_applet_type = AppletType_Default;
 
 void __libnx_initheap(void)
 {
@@ -69,6 +73,8 @@ static Result readSetting(const char* key, void* buf, size_t size)
 void __appInit(void)
 {
     Result rc;
+
+	__nx_applet_type = AppletType_Application;
 
     rc = smInitialize();
     if (R_FAILED(rc))
@@ -239,6 +245,15 @@ static void getOwnProcessHandle(void)
     threadClose(&t);
 }
 
+void err(const char* msg)
+{
+#ifdef DEBUG
+	FILE* f = fopen("sdmc:/hbl.log", "w+");
+	fwrite(msg, strlen(msg), 1, f);
+	fclose(f);
+#endif
+}
+
 void loadNro(void)
 {
     NroHeader* header = NULL;
@@ -288,8 +303,28 @@ void loadNro(void)
 
     if (g_nextNroPath[0] == '\0')
     {
-        memcpy(g_nextNroPath, DEFAULT_NRO, sizeof(DEFAULT_NRO));
-        memcpy(g_nextArgv,    DEFAULT_NRO, sizeof(DEFAULT_NRO));
+		if(*g_launchArgs)
+		{
+			memset(g_nextArgv, 0, sizeof(g_nextArgv));
+			memset(g_nextNroPath, 0, sizeof(g_nextNroPath));
+
+			strncpy(g_nextNroPath, g_launchArgs, sizeof(g_nextNroPath) - 2);
+
+			for(int i=0; i < sizeof(g_nextNroPath) - 2; i++)
+			{
+				if(g_nextNroPath[i] == ' ')
+				{
+					g_nextNroPath[i] = NULL;
+					break;
+				}
+			}
+			strncpy(g_nextArgv,    g_launchArgs, sizeof(g_nextArgv) - 2);
+		}
+		else
+		{
+			memcpy(g_nextNroPath, DEFAULT_NRO, sizeof(DEFAULT_NRO));
+			memcpy(g_nextArgv,    DEFAULT_NRO, sizeof(DEFAULT_NRO));
+		}
     }
 
     memcpy(g_argv, g_nextArgv, sizeof g_argv);
@@ -300,9 +335,6 @@ void loadNro(void)
     header = (NroHeader*) (nrobuf + sizeof(NroStart));
     uint8_t*   rest   = (uint8_t*)   (nrobuf + sizeof(NroStart) + sizeof(NroHeader));
 
-    rc = fsdevMountSdmc();
-    if (R_FAILED(rc))
-        fatalThrow(MAKERESULT(Module_HomebrewLoader, 404));
 
     int fd = open(g_nextNroPath, O_RDONLY);
     if (fd < 0)
@@ -451,9 +483,187 @@ void loadNro(void)
     nroEntrypointTrampoline((u64) entries, -1, entrypoint);
 }
 
+static Service g_appletSrv;
+
+static Result _appletCmdNoInOutU64(Service* srv, u64 *out, u32 cmd_id) {
+    serviceAssumeDomain(srv);
+    return serviceDispatchOut(srv, cmd_id, *out);
+}
+
+static Result _appletStorageAccessorRW(Service* srv, size_t ipcbufsize, s64 offset, void* buffer, size_t size, bool rw) {
+    serviceAssumeDomain(srv);
+    return serviceDispatchIn(srv, rw ? 10 : 11, offset,
+        .buffer_attrs = { SfBufferAttr_HipcAutoSelect | (rw ? SfBufferAttr_In : SfBufferAttr_Out) },
+        .buffers = { { buffer, size } },
+    );
+}
+
+static Result _appletGetSessionProxy(Service* srv_out, Handle prochandle, u32 cmd_id) {
+    u64 reserved=0;
+    serviceAssumeDomain(&g_appletSrv);
+    return serviceDispatchIn(&g_appletSrv, cmd_id, reserved,
+        .in_send_pid = true,
+        .in_num_handles = 1,
+        .in_handles = { prochandle },
+        .out_num_objects = 1,
+        .out_objects = srv_out,
+    );
+}
+
+static Result _appletCmdGetSession(Service* srv, Service* srv_out, u32 cmd_id) {
+    serviceAssumeDomain(srv);
+    return serviceDispatch(srv, cmd_id,
+        .out_num_objects = 1,
+        .out_objects = srv_out,
+    );
+}
+
+static Result _appletStorageGetSize(AppletStorage *s, s64 *size) {
+    Result rc=0;
+    Service tmp_srv;//IStorageAccessor
+
+    if (!serviceIsActive(&s->s))
+        return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
+
+    rc = _appletCmdGetSession(&s->s, &tmp_srv, 0);//Open
+    if (R_FAILED(rc)) return rc;
+
+    rc = _appletCmdNoInOutU64(&tmp_srv, (u64*)size, 0);
+    serviceAssumeDomain(&tmp_srv);
+    serviceClose(&tmp_srv);
+
+    return rc;
+}
+
+static Result _appletPopLaunchParameter(AppletStorage *s, AppletLaunchParameterKind kind) {
+    u32 tmp=kind;
+    memset(s, 0, sizeof(AppletStorage));
+    serviceAssumeDomain(appletGetServiceSession_Functions());
+    return serviceDispatchIn(appletGetServiceSession_Functions(), 1, tmp,
+        .out_num_objects = 1,
+        .out_objects = &s->s,
+    );
+}
+
+static Result _appletStorageRW(AppletStorage *s, s64 offset, void* buffer, size_t size, bool rw) {
+    Result rc=0;
+    Service tmp_srv;//IStorageAccessor
+
+    if (!serviceIsActive(&s->s))
+        return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
+
+    rc = _appletCmdGetSession(&s->s, &tmp_srv, 0);//Open
+    if (R_FAILED(rc)) return rc;
+
+    if (R_SUCCEEDED(rc)) rc = _appletStorageAccessorRW(&tmp_srv, tmp_srv.pointer_buffer_size, offset, buffer, size, rw);
+    serviceAssumeDomain(&tmp_srv);
+    serviceClose(&tmp_srv);
+
+    return rc;
+}
+
+static Result _appletStorageRead(AppletStorage *s, s64 offset, void* buffer, size_t size) {
+    return _appletStorageRW(s, offset, buffer, size, false);
+}
+
+#define AM_BUSY_ERROR 0x19280
+
+void initArguments(void)
+{
+	Result rc;
+
+	rc = smGetService(&g_appletSrv, "appletOE");
+
+	if (R_SUCCEEDED(rc))
+	{
+        rc = serviceConvertToDomain(&g_appletSrv);
+
+		if(R_FAILED(rc))
+		{
+			err("serviceConvertToDomain failed");
+			return;
+		}
+    }
+	else
+	{
+		err("smGetService failed");
+		return;
+	}
+
+	do
+	{
+		rc = _appletGetSessionProxy(appletGetServiceSession_Proxy(), CUR_PROCESS_HANDLE, 0);
+
+		if (rc == AM_BUSY_ERROR)
+		{
+            svcSleepThread(10000000);
+        }
+	}
+	while(rc == AM_BUSY_ERROR);
+
+	if (R_FAILED(rc)) {
+		err("appletGetSessionProxy failed");
+		serviceClose(&g_appletSrv);
+		return;
+	}
+
+	rc = _appletCmdGetSession(appletGetServiceSession_Proxy(), appletGetServiceSession_Functions(), 20);
+
+	if (R_FAILED(rc)) {
+		serviceClose(appletGetServiceSession_Proxy());
+		serviceClose(&g_appletSrv);
+		err("_appletCmdGetSession failed");
+	}
+
+	AppletStorage s;
+	memset(&g_launchArgs, 0, sizeof(g_launchArgs));
+
+	if(!_appletPopLaunchParameter(&s, AppletLaunchParameterKind_UserChannel))
+	{
+		s64 sz = 0;
+
+		if(!_appletStorageGetSize(&s, &sz))
+		{
+			if(sz > sizeof(g_launchArgs))
+			{
+				sz = sizeof(g_launchArgs)-2;
+			}
+
+			if(R_SUCCEEDED(_appletStorageRead(&s, 0, g_launchArgs, sz)))
+			{
+			}
+			else
+			{
+				err("appletStorageRead failed");
+			}
+		}
+		else
+		{
+			err("appletStorageGetSize failed");
+		}
+
+		appletStorageClose(&s);
+	}
+	else
+	{
+		err("appletPopLaunchParameter failed");
+	}
+
+	serviceClose(appletGetServiceSession_Functions());
+	serviceClose(appletGetServiceSession_Proxy());
+    serviceClose(&g_appletSrv);
+}
+
 int main(int argc, char **argv)
 {
     memcpy(g_savedTls, (u8*)armGetTls() + 0x100, 0x100);
+
+	auto rc = fsdevMountSdmc();
+
+    if (R_FAILED(rc))
+        fatalThrow(MAKERESULT(Module_HomebrewLoader, 404));
+
+	initArguments();
 
     getIsApplication();
     getIsAutomaticGameplayRecording();
